@@ -4,16 +4,13 @@ on:
   push:
     branches:
       - main
+  workflow_dispatch:
   # schedule:
   #   - cron: "0 0 * * MON"
 
-env:
-  RELEASE_URL: https://gist.githubusercontent.com/csrutil/a448f7d1e9d6f0b8487fabd45dfc759f/raw/26642dc5b5a35cc954e14c7cd5edea8f197dc30d/OpenWrt-NIC-Drivers-release.txt
-  KMOD_VERSION: 9.015.00
-  APT_URL: https://gist.githubusercontent.com/csrutil/6d83b7dd62b5652697fe22271fbee482/raw/3fe019895bf3425e1f40518b83dd81306c2291f8/depends-ubuntu-2004
-
 jobs:
   build_r8125_modules:
+    name: Build Modules
     runs-on: ubuntu-22.04
     continue-on-error: true
 
@@ -21,12 +18,9 @@ jobs:
       fail-fast: false
       matrix:
         sdk_url:
-          - https://downloads.openwrt.org/releases/19.07.10/targets/x86/64/openwrt-sdk-19.07.10-x86-64_gcc-7.5.0_musl.Linux-x86_64.tar.xz
-          - https://downloads.openwrt.org/releases/21.02.7/targets/x86/64/openwrt-sdk-21.02.7-x86-64_gcc-8.4.0_musl.Linux-x86_64.tar.xz
+          - https://downloads.openwrt.org/releases/22.03.5/targets/x86/64/openwrt-sdk-22.03.5-x86-64_gcc-11.2.0_musl.Linux-x86_64.tar.xz
           - https://downloads.openwrt.org/releases/22.03.6/targets/x86/64/openwrt-sdk-22.03.6-x86-64_gcc-11.2.0_musl.Linux-x86_64.tar.xz
-          - https://downloads.openwrt.org/releases/23.05.4/targets/x86/64/openwrt-sdk-23.05.4-x86-64_gcc-12.3.0_musl.Linux-x86_64.tar.xz
-          - https://downloads.openwrt.org/releases/24.10.0/targets/x86/64/openwrt-sdk-24.10.0-x86-64_gcc-13.3.0_musl.Linux-x86_64.tar.zst
-          - https://downloads.openwrt.org/releases/24.10.1/targets/x86/64/openwrt-sdk-24.10.1-x86-64_gcc-13.3.0_musl.Linux-x86_64.tar.zst
+          - https://downloads.openwrt.org/releases/22.03.7/targets/x86/64/openwrt-sdk-22.03.7-x86-64_gcc-11.2.0_musl.Linux-x86_64.tar.xz
 
     steps:
     - name: Checkout repository
@@ -38,109 +32,108 @@ jobs:
       run: |
         sudo rm -rf /etc/apt/sources.list.d/* /usr/share/dotnet /usr/local/lib/android /opt/ghc
         sudo apt-get update -qq
-        sudo apt-get install -qq -y $(curl -fsSL $APT_URL) tree jq
+        sudo apt-get install -qq -y build-essential asciidoc binutils bzip2 gawk gettext git libncurses5-dev libz-dev patch python3 python2.7 unzip zlib1g-dev libc6-dev-i386 subversion flex uglifyjs git-core gcc-multilib p7zip p7zip-full msmtp libssl-dev texinfo libglib2.0-dev xmlto qemu-utils upx libelf-dev autoconf automake libtool autopoint device-tree-compiler g++-multilib antlr3 gperf wget curl swig rsync python3 git-core curl tree jq
         sudo apt-get autoremove --purge -qq
         sudo apt-get clean -qq
 
     - name: Download and Extract SDK
       run: |
-        sdk=$(basename ${{ matrix.sdk_url }} | sed -E 's/\.tar\.(xz|zst)$//')
-        wget ${{ matrix.sdk_url }}
-        case ${{ matrix.sdk_url }} in
-          *.tar.xz) tar -xvf $sdk.tar.xz ;;
-          *.tar.zst) tar --zstd -xvf $sdk.tar.zst ;;
+        sdk=$(basename "${{ matrix.sdk_url }}" | sed -E 's/\.tar\.(xz|zst)$//')
+        wget -nv "${{ matrix.sdk_url }}"
+        case "${{ matrix.sdk_url }}" in
+          *.tar.xz) tar -xf "${sdk}.tar.xz" ;;
+          *.tar.zst) tar --zstd -xf "${sdk}.tar.zst" ;;
+          *)
+            echo "::error Unknown sdk"
+            exit 1
+            ;;
         esac
-        mkdir -p $sdk/package
-        cp -r r8125 $sdk/package/
+        mkdir -p "${sdk}/package"
+        cp -r r8125 "${sdk}/package/"
 
     - name: Compile Driver
       run: |
-        sdk=$(basename ${{ matrix.sdk_url }} | sed -E 's/\.tar\.(xz|zst)$//')
+        sdk=$(basename "${{ matrix.sdk_url }}" | sed -E 's/\.tar\.(xz|zst)$//')
 
-        cd $sdk
+        cd "${sdk}"
         echo 'CONFIG_PACKAGE_kmod-r8125=m' > .config
         make defconfig
         if ! make package/r8125/compile -j$(nproc); then
           make package/r8125/compile -j1 V=sc || echo "Compilation failed for ${{ matrix.sdk_url }}!"
         fi
 
-        cd ${{ github.workspace }}
+        cd "${{ github.workspace }}"
         mkdir -p artifact
         find . -name 'kmod-r8125*.ipk' -exec mv {} artifact/ \;
 
-        echo "SDK=$sdk" >> $GITHUB_ENV
+        echo "sdk=${sdk}" >> "${GITHUB_ENV}"
 
     - name: Upload Build Artifacts
       uses: actions/upload-artifact@v4
       with:
-        name: kmod-r8125-${{ env.SDK }}
+        name: kmod-r8125-${{ env.sdk }}
         path: ${{ github.workspace }}/artifact/**/*
         if-no-files-found: error
 
-  collect_and_upload:
+  upload_release:
+    name: Upload Release
     needs: build_r8125_modules
     runs-on: ubuntu-latest
     steps:
-    - name: Download Artifacts
+    - name: Checkout repository
+      uses: actions/checkout@v3
+
+    - name: Download All Artifacts
       uses: actions/download-artifact@v4
       with:
         path: all_artifacts
         pattern: kmod-r8125-*
         merge-multiple: true
 
-    - name: Merge All Artifacts
+    - name: Driver Features
       run: |
-        mkdir -p combined_artifact
-        find all_artifacts -name '*.ipk' -exec mv {} combined_artifact/ \;
-        cd combined_artifact && md5sum *.ipk > md5sum.txt
+        echo -e "## Driver Features\n" >> release_note.md
+        echo "| Feature name | Value |" >> release_note.md
+        echo "| ------------ | ----- |" >> release_note.md
+        grep -E '^\w+\s*=\s*\S*$' "r8125/src/Makefile" | awk -F '[[:space:]]*=[[:space:]]*' '{print "| "$1" | "$2" |"}' >> release_note.md
+        echo "" >> release_note.md
 
-    - name: Upload Combined Artifact
-      uses: actions/upload-artifact@v4
-      with:
-        name: ${{ env.KMOD_VERSION }}
-        path: combined_artifact/**/*
-
-  deploy:
-    needs: collect_and_upload
-    name: Create Release and Upload Artifacts
-    runs-on: ubuntu-latest
-
-    steps:
-    - name: Download Combined Artifact
-      uses: actions/download-artifact@v4
-      with:
-        name: ${{ env.KMOD_VERSION }}
-
-    - name: Prepare Release
+    - name: Artifact Digest
       run: |
-        wget -O release.txt $RELEASE_URL
-        echo -e "\nUpdated at $(date)" >> release.txt
+        mkdir -p merged_artifact
+        find all_artifacts -name '*.ipk' -exec mv {} merged_artifact/ \;
+        cd merged_artifact
+        echo -e "## Assets Digest\n" >> ../release_note.md
+        echo "| File name | MD5 | SHA1 | SHA256 |" >> ../release_note.md
+        echo "| --------- | --- | ---- | ------ |" >> ../release_note.md
+        for file in *.ipk; do
+          md5=$(md5sum "${file}" | awk '{print $1}')
+          sha1=$(sha1sum "${file}" | awk '{print $1}')
+          sha256=$(sha256sum "${file}" | awk '{print $1}')
+          echo '| `'"${file}"'` | `'"${md5}"'` | `'"${sha1}"'` | `'"${sha256}"'` |' >> ../release_note.md
+        done
+        echo "" >> ../release_note.md
 
-        mkdir -p artifact
-        mv *.ipk artifact/
-        cd artifact && md5sum *.ipk > md5sum.txt
+    - name: Build Info
+      run: |
+        echo -e "## Build Info\n" >> release_note.md
+        echo "Updated at $(date)" >> release_note.md
+        echo "Build From ${{ github.sha }}" >> release_note.md
+        echo "" >> release_note.md
+        pkg_version=$(grep -E '^PKG_VERSION\s*:=\s*\S*$' "r8125/Makefile" | awk -F '[[:space:]]*:=[[:space:]]*' '{print $2}')
+        if [[ -z "${pkg_version}" ]]; then
+          echo "::error Unknown pkg_version"
+          exit 1
+        fi
+        echo "pkg_version=${pkg_version}" >> "${GITHUB_ENV}"
 
     - name: Upload to GitHub Release
       uses: softprops/action-gh-release@v1
       with:
-        name: ${{ env.KMOD_VERSION }}
-        tag_name: ${{ env.KMOD_VERSION }}
-        body_path: release.txt
-        files: artifact/**/*
+        name: ${{ env.pkg_version }}-${{ github.sha }}
+        tag_name: ${{ env.pkg_version }}-${{ github.sha }}
+        body_path: release_note.md
+        files: merged_artifact/*
+        fail_on_unmatched_files: true
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-    - name: Cleanup Old Releases
-      uses: dev-drprasad/delete-older-releases@v0.3.1
-      with:
-        keep_latest: 2
-        delete_tags: true
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-    - name: Delete Build Artifacts
-      uses: geekyeggo/delete-artifact@v2
-      with:
-        name: |
-          kmod-r8125-*
-          ${{ env.KMOD_VERSION }}
